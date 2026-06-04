@@ -78,28 +78,23 @@ class TestPrepareImage:
 class TestRunGeoref:
     def test_creates_geotiff_with_correct_crs(self, small_png, four_gcps, tmp_path):
         out = tmp_path / "output.tif"
-        run_georef(small_png, four_gcps, 4326, out)
+        run_georef(small_png, four_gcps, 4269, out)
         assert out.exists()
         with rasterio.open(str(out)) as ds:
-            assert ds.crs.to_epsg() == 4326
+            assert ds.crs.to_epsg() == 4269
 
     def test_output_has_pixel_data(self, small_png, four_gcps, tmp_path):
         out = tmp_path / "output.tif"
-        run_georef(small_png, four_gcps, 4326, out)
+        run_georef(small_png, four_gcps, 4269, out)
         with rasterio.open(str(out)) as ds:
             data = ds.read()
-        assert data.shape[1] == 100
-        assert data.shape[2] == 100
+        assert data.ndim == 3   # (bands, height, width)
+        assert data.size > 0
 
-    def test_epsg_3857_accepted(self, small_png, four_gcps, tmp_path):
-        gcps = [
-            {"px": 0,   "py": 0,   "lon": -8905559.0, "lat": 4865942.0},
-            {"px": 100, "py": 0,   "lon": -8794111.0, "lat": 4865942.0},
-            {"px": 100, "py": 100, "lon": -8794111.0, "lat": 4721671.0},
-            {"px": 0,   "py": 100, "lon": -8905559.0, "lat": 4721671.0},
-        ]
+    def test_output_warped_to_web_mercator(self, small_png, four_gcps, tmp_path):
+        # GCPs are always WGS84 lon/lat from Leaflet; output CRS is independent
         out = tmp_path / "output_3857.tif"
-        run_georef(small_png, gcps, 3857, out)
+        run_georef(small_png, four_gcps, 3857, out)
         with rasterio.open(str(out)) as ds:
             assert ds.crs.to_epsg() == 3857
 
@@ -124,4 +119,4 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(main, ["--help"])
         assert "5000" in result.output
-        assert "4326" in result.output
+        assert "4269" in result.output

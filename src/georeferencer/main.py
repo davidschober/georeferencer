@@ -33,9 +33,11 @@ import tempfile
 from flask import Flask, Response, jsonify, request, send_file
 from PIL import Image
 import rasterio
-from rasterio.transform import from_gcps
 from rasterio.control import GroundControlPoint
 from rasterio.crs import CRS
+from rasterio.io import MemoryFile
+from rasterio.transform import from_gcps
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 
 # ---------------------------------------------------------------------------
@@ -100,39 +102,79 @@ def prepare_image(input_path: Path, work_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def run_georef(src_png: Path, gcps_data: list, epsg: int, output_path: Path):
-    """Write a GeoTIFF from src_png using the provided GCP list."""
-    with rasterio.open(str(src_png)) as src:
-        width = src.width
-        height = src.height
-        data = src.read()
-        count = src.count
+    """Write a warped GeoTIFF from src_png using the provided GCP list.
 
-    crs = CRS.from_epsg(epsg)
+    GCPs are always in WGS84 (EPSG:4326) from Leaflet. Strategy:
+    1. Fit an affine transform from the GCPs (from_gcps).
+    2. Write the source pixels into an in-memory GeoTIFF with that transform
+       already embedded — GDAL can then read the georeference normally.
+    3. Reproject that in-memory dataset to the target CRS.
+    This avoids both GDAL's homography path (which fails on non-convex quads)
+    and the SRC_METHOD=NO_GEOTRANSFORM issue that arises when reproject is
+    given a source file with no embedded georeference.
+    """
+    gcp_crs = CRS.from_epsg(4326)
+    target_crs = CRS.from_epsg(epsg)
+
     gcps = [
-        GroundControlPoint(
-            row=g["py"],
-            col=g["px"],
-            x=g["lon"],
-            y=g["lat"],
-        )
+        GroundControlPoint(row=g["py"], col=g["px"], x=g["lon"], y=g["lat"])
         for g in gcps_data
     ]
 
-    transform = from_gcps(gcps)
+    src_transform = from_gcps(gcps)
 
-    profile = {
+    with rasterio.open(str(src_png)) as src:
+        w, h = src.width, src.height
+        data = src.read()
+        dtype = src.dtypes[0]
+        count = src.count
+
+    # Derive bounds from the four corners of the affine-mapped image
+    corners = [src_transform * (col, row)
+               for col, row in [(0, 0), (w, 0), (w, h), (0, h)]]
+    lons = [c[0] for c in corners]
+    lats = [c[1] for c in corners]
+
+    dst_transform, out_width, out_height = calculate_default_transform(
+        gcp_crs, target_crs, w, h,
+        left=min(lons), right=max(lons),
+        bottom=min(lats), top=max(lats),
+    )
+    dst_profile = {
         "driver": "GTiff",
-        "dtype": data.dtype,
-        "width": width,
-        "height": height,
+        "dtype": dtype,
+        "width": out_width,
+        "height": out_height,
         "count": count,
-        "crs": crs,
-        "transform": transform,
+        "crs": target_crs,
+        "transform": dst_transform,
     }
 
-    with rasterio.open(str(output_path), "w", **profile) as dst:
-        dst.write(data)
-        dst.update_tags(GEOREF_TOOL="georeferencer")
+    # Write source data into an in-memory GeoTIFF with the affine embedded
+    src_profile = {
+        "driver": "GTiff",
+        "dtype": dtype,
+        "width": w,
+        "height": h,
+        "count": count,
+        "crs": gcp_crs,
+        "transform": src_transform,
+    }
+    with MemoryFile() as mem:
+        with mem.open(**src_profile) as mem_ds:
+            mem_ds.write(data)
+        with mem.open() as mem_ds:
+            with rasterio.open(str(output_path), "w", **dst_profile) as dst:
+                for band_idx in range(1, count + 1):
+                    reproject(
+                        source=rasterio.band(mem_ds, band_idx),
+                        destination=rasterio.band(dst, band_idx),
+                        src_crs=gcp_crs,
+                        dst_transform=dst_transform,
+                        dst_crs=target_crs,
+                        resampling=Resampling.lanczos,
+                    )
+                dst.update_tags(GEOREF_TOOL="georeferencer")
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +274,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #map-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   #map { flex: 1; }
 
+  /* ── map search ── */
+  #map-search {
+    display: flex; padding: 5px 8px; gap: 6px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  #map-search-input {
+    flex: 1; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 3px; padding: 3px 8px; color: var(--text);
+    font-family: var(--font-mono); font-size: 12px; outline: none;
+  }
+  #map-search-input:focus { border-color: var(--teal); }
+  #map-search-input::placeholder { color: var(--muted); }
+  #map-search-btn {
+    background: transparent; border: 1px solid var(--border); border-radius: 3px;
+    color: var(--muted); font-family: var(--font-mono); font-size: 12px;
+    padding: 3px 10px; cursor: pointer; transition: all 0.15s; white-space: nowrap;
+  }
+  #map-search-btn:hover { border-color: var(--teal); color: var(--teal); }
+
   /* ── GCP panel ── */
   #gcp-panel {
     height: 140px; flex-shrink: 0;
@@ -329,6 +391,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="pane-header">
       <span>OpenStreetMap</span>
       <span class="pane-hint" id="map-hint">click to place matching point</span>
+    </div>
+    <div id="map-search">
+      <input id="map-search-input" type="text" placeholder="Search for a place…" autocomplete="off" spellcheck="false"/>
+      <button id="map-search-btn">Search</button>
     </div>
     <div id="map"></div>
   </div>
@@ -714,6 +780,40 @@ document.getElementById('btn-close').addEventListener('click', async () => {
 
 const EPSG = __EPSG__;
 
+// ─────────────────────────────────────────────
+//  Map search (Nominatim)
+// ─────────────────────────────────────────────
+async function searchPlace(query) {
+  query = query.trim();
+  if (!query) return;
+  const btn = document.getElementById('map-search-btn');
+  btn.textContent = 'Searching…';
+  btn.disabled = true;
+  try {
+    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(query);
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    const data = await res.json();
+    if (data.length > 0) {
+      map.flyTo([parseFloat(data[0].lat), parseFloat(data[0].lon)], 10);
+    } else {
+      btn.textContent = 'Not found';
+      setTimeout(() => { btn.textContent = 'Search'; btn.disabled = false; }, 1500);
+      return;
+    }
+  } catch(e) {
+    console.warn('Search error:', e);
+  }
+  btn.textContent = 'Search';
+  btn.disabled = false;
+}
+
+document.getElementById('map-search-btn').addEventListener('click', () => {
+  searchPlace(document.getElementById('map-search-input').value);
+});
+document.getElementById('map-search-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') searchPlace(e.target.value);
+});
+
 updateHints();
 updateExportButton();
 renderGCPList();
@@ -732,7 +832,7 @@ app.config["PROPAGATE_EXCEPTIONS"] = True
 
 _source_png: Path = None
 _output_path: Path = None
-_epsg: int = 4326
+_epsg: int = 4269
 
 
 @app.route("/")
@@ -779,7 +879,7 @@ def shutdown():
 @click.command()
 @click.argument("input", type=click.Path(exists=True, dir_okay=False))
 @click.option("--port", default=5000, show_default=True, help="Local server port")
-@click.option("--epsg", default=4326, show_default=True, help="Output CRS EPSG code")
+@click.option("--epsg", default=4269, show_default=True, help="Output CRS EPSG code (4269=NAD83, 4326=WGS84, 3857=Web Mercator)")
 def main(input, port, epsg):
     """Lightweight georeferencing tool — place GCPs on the source image and map, then export a GeoTIFF."""
     global _source_png, _output_path, _epsg
